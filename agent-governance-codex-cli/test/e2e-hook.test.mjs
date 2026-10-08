@@ -8,7 +8,7 @@
 // no network, and no hook-trust grant, so it runs in CI.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -40,6 +40,8 @@ async function withAuditHome(run) {
     return await run({
       CODEX_HOME: home,
       AGT_CODEX_AUDIT_PATH: join(home, "agt", "audit-log.json"),
+      // The hook only defaults this with ??=, so an exported policy would win.
+      AGT_CODEX_POLICY_PATH: join(home, "agt", "policy.json"),
     });
   } finally {
     await rm(home, { recursive: true, force: true });
@@ -63,6 +65,32 @@ test("PreToolUse denies a secret-file read and records the decision", async () =
     const audit = JSON.parse(await readFile(env.AGT_CODEX_AUDIT_PATH, "utf8"));
     assert.equal(audit.at(-1).decision, "deny");
   });
+});
+
+test("PreToolUse denies a secret-file read when an advisory policy is already exported", async () => {
+  const policyRoot = await mkdtemp(join(tmpdir(), "agt-codex-inherited-policy-"));
+  const advisoryPath = join(policyRoot, "advisory-policy.json");
+  await writeFile(advisoryPath, JSON.stringify({ version: 1, mode: "advisory" }));
+  const previous = process.env.AGT_CODEX_POLICY_PATH;
+  process.env.AGT_CODEX_POLICY_PATH = advisoryPath;
+  try {
+    await withAuditHome(async (env) => {
+      const payload = await loadFixture("pre-tool-use.deny-secret-read.json");
+      const { code, stdout } = await runHook(payload, env);
+
+      assert.equal(code, 0, "a policy deny is a successful hook run, not a hook crash");
+      const out = JSON.parse(stdout);
+      assert.equal(out.hookSpecificOutput.permissionDecision, "deny");
+      assert.match(out.hookSpecificOutput.permissionDecisionReason, /credential|secret/i);
+    });
+  } finally {
+    if (previous === undefined) {
+      delete process.env.AGT_CODEX_POLICY_PATH;
+    } else {
+      process.env.AGT_CODEX_POLICY_PATH = previous;
+    }
+    await rm(policyRoot, { recursive: true, force: true });
+  }
 });
 
 test("PreToolUse allows a plain file read with no deny decision", async () => {
